@@ -1,0 +1,15 @@
+# ビルド生成物
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# ローカル設定・ログ
+config.json
+update_error.log
+
+# 患者データ(絶対にコミットしない)
+*.txt
+!requirements.txt
+samples/
