@@ -1,6 +1,8 @@
 # ビルド生成物
 build/
 dist/
+配布/
+*.exe
 *.spec
 __pycache__/
 *.pyc

@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-NSIPS TXT → Excel 転記ツール
+NSIPS TXT → CSV 転記ツール
 ------------------------------------
 レセコン(NSIPS)が出力するTXTファイルを監視し、新しいTXTが出来たら
-内容を抽出してExcelひな形に転記、元TXTと同名の .xlsx として
-出力フォルダへ保存する常駐GUIツール。
+内容を抽出して、元TXTと同名の .csv として出力フォルダへ保存する常駐GUIツール。
 
-パッチ更新システム(GitHub Releasesベース自動更新) / 更新履歴表示を搭載。
-依存: openpyxl (標準の tkinter を使用)
+・処理済みTXTはファイル名で記録し、監視再開・再起動後も再処理しない
+・Windowsスタートアップ登録チェックボックス
+・パッチ更新システム(GitHub Releasesベース自動更新) / 更新履歴表示
+依存: 標準ライブラリのみ (openpyxl不要)
 """
 
 import os
 import sys
+import csv
 import json
-import time
 import ssl
 import threading
 import traceback
@@ -25,7 +26,10 @@ import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-import openpyxl
+try:
+    import winreg  # Windows のみ
+except ImportError:
+    winreg = None
 
 # ---------------------------------------------------------------------------
 # パス解決 (PyInstaller onefile / スクリプト 両対応)
@@ -38,7 +42,7 @@ def base_dir():
 
 
 def resource_path(name):
-    """同梱リソース(template/VERSION/CHANGELOG)のパス。"""
+    """同梱リソース(VERSION/CHANGELOG)のパス。"""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         p = os.path.join(sys._MEIPASS, name)
         if os.path.exists(p):
@@ -48,8 +52,12 @@ def resource_path(name):
 
 BASE_DIR      = base_dir()
 CONFIG_PATH   = os.path.join(BASE_DIR, "config.json")
-TEMPLATE_PATH = resource_path("template.xlsx")
 POLL_INTERVAL = 3.0                    # 監視ポーリング間隔(秒)
+CSV_ENCODING  = "cp932"                # 出力CSVの文字コード (Shift-JIS)
+
+# Windows スタートアップ登録
+STARTUP_KEY   = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_NAME  = "NSIPSConverter"
 
 # GitHub Releases 自動更新
 GITHUB_REPO   = "kngmincorp-stack/NSIPSConverter"
@@ -121,17 +129,6 @@ def _fmt_date(s):
     return s
 
 
-def _num_or_str(s):
-    """数値文字列は int に。ただし先頭ゼロ('01'等)は文字列のまま保持。"""
-    s = (s or "").strip()
-    if s.isdigit() and not (len(s) > 1 and s[0] == "0"):
-        try:
-            return int(s)
-        except ValueError:
-            return s
-    return s
-
-
 def parse_txt(path):
     """
     NSIPS TXT を解析して転記用 dict を返す。解析不可なら ValueError。
@@ -179,42 +176,33 @@ def parse_txt(path):
     last_visit = max(visit_dates) if visit_dates else ""
 
     return {
-        "患者番号":   _num_or_str(g(1)),
+        "患者番号":   g(1),
         "カナ氏名":   g(2),
         "漢字氏名":   g(3),
         "生年月日":   _fmt_date(g(5)),
         "性別":       sex,
-        "保険者番号": _num_or_str(g(14)),
+        "保険者番号": g(14),
         "記号":       g(16),
-        "番号":       _num_or_str(g(17)),
+        "番号":       g(17),
         "枝番":       edaban,
         "本/家":      honke,
         "最終来局日": _fmt_date(last_visit),
     }
 
 
-COL_MAP = [
-    ("A", "患者番号"), ("B", "カナ氏名"), ("C", "漢字氏名"),
-    ("D", "生年月日"), ("E", "性別"), ("F", "保険者番号"),
-    ("G", "記号"), ("H", "番号"), ("I", "枝番"),
-    ("J", "本/家"), ("K", "最終来局日"),
+# 出力CSVの列順(=見本Excelの列順)
+CSV_COLUMNS = [
+    "患者番号", "カナ氏名", "漢字氏名", "生年月日", "性別", "保険者番号",
+    "記号", "番号", "枝番", "本/家", "最終来局日",
 ]
-_TEXT_COLS = ("生年月日", "最終来局日", "記号", "枝番",
-              "カナ氏名", "漢字氏名", "性別", "本/家")
 
 
-def write_excel(data, out_path):
-    """ひな形をコピーして2行目に転記し out_path へ保存。"""
-    if not os.path.exists(TEMPLATE_PATH):
-        raise FileNotFoundError("ひな形 template.xlsx が見つかりません: %s" % TEMPLATE_PATH)
-    wb = openpyxl.load_workbook(TEMPLATE_PATH)
-    ws = wb.active
-    for col, key in COL_MAP:
-        cell = ws["%s2" % col]
-        cell.value = data.get(key, "")
-        if key in _TEXT_COLS:
-            cell.number_format = "@"   # 先頭ゼロ・スラッシュ表示を保持
-    wb.save(out_path)
+def write_csv(data, out_path):
+    """1患者分を見出し付きCSV(Shift-JIS)で出力。"""
+    with open(out_path, "w", encoding=CSV_ENCODING, newline="", errors="replace") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_COLUMNS)
+        w.writerow([data.get(k, "") for k in CSV_COLUMNS])
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +211,7 @@ def write_excel(data, out_path):
 DEFAULT_CONFIG = {
     "watch_folder": "",
     "output_folder": "",
-    "processed": [],
+    "processed": [],           # 処理済みTXTのファイル名リスト
     "last_seen_version": "",
 }
 
@@ -248,11 +236,38 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------------------
+# Windows スタートアップ登録
+# ---------------------------------------------------------------------------
+def startup_enabled():
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, STARTUP_NAME)
+            return bool(val)
+    except OSError:
+        return False
+
+
+def set_startup(enable):
+    """スタートアップ登録/解除。frozen(exe)時のみ意味を持つ。"""
+    if winreg is None:
+        raise OSError("Windows 以外では利用できません")
+    exe = sys.executable
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if enable:
+            winreg.SetValueEx(k, STARTUP_NAME, 0, winreg.REG_SZ, '"%s"' % exe)
+        else:
+            try:
+                winreg.DeleteValue(k, STARTUP_NAME)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # 自動更新 (GitHub Releases / 単一exe置換)
 # ---------------------------------------------------------------------------
 class Updater:
-    """バックグラウンドで最新リリースを確認し、単一exeを置換更新する。"""
-
     def __init__(self, app):
         self.app = app
         self._latest = None
@@ -372,9 +387,9 @@ class App:
         self._stop_evt = threading.Event()
         self.updater = Updater(self)
 
-        root.title("NSIPS TXT → Excel 転記ツール  v%s" % APP_VERSION)
-        root.geometry("780x560")
-        root.minsize(700, 480)
+        root.title("NSIPS TXT → CSV 転記ツール  v%s" % APP_VERSION)
+        root.geometry("790x580")
+        root.minsize(700, 500)
         pad = {"padx": 6, "pady": 4}
 
         # 監視元フォルダ
@@ -386,7 +401,7 @@ class App:
         ttk.Button(frm_w, text="開く", command=lambda: self.open_folder(self.var_watch.get())).pack(side="left", padx=3, pady=6)
 
         # 出力先フォルダ
-        frm_o = ttk.LabelFrame(root, text="出力先フォルダ (Excel保存先)")
+        frm_o = ttk.LabelFrame(root, text="出力先フォルダ (CSV保存先)")
         frm_o.pack(fill="x", **pad)
         self.var_out = tk.StringVar(value=self.cfg.get("output_folder", ""))
         ttk.Entry(frm_o, textvariable=self.var_out).pack(side="left", fill="x", expand=True, padx=6, pady=6)
@@ -403,6 +418,18 @@ class App:
         self.lbl_status = ttk.Label(frm_b, text="停止中", foreground="#a00")
         self.lbl_status.pack(side="right", padx=8)
 
+        # オプション行(スタートアップ登録)
+        frm_s = ttk.Frame(root)
+        frm_s.pack(fill="x", **pad)
+        self.var_startup = tk.BooleanVar(value=startup_enabled())
+        self.cb_startup = ttk.Checkbutton(
+            frm_s, text="Windowsスタートアップに登録（PC起動時に自動で立ち上げる）",
+            variable=self.var_startup, command=self.toggle_startup)
+        self.cb_startup.pack(side="left", padx=4)
+        if not getattr(sys, "frozen", False):
+            self.cb_startup.configure(state="disabled")
+            ttk.Label(frm_s, text="(exe版で有効)", foreground="#999").pack(side="left")
+
         # 更新・履歴ボタン
         frm_u = ttk.Frame(root)
         frm_u.pack(fill="x", **pad)
@@ -413,16 +440,22 @@ class App:
         # ログ
         frm_l = ttk.LabelFrame(root, text="ログ")
         frm_l.pack(fill="both", expand=True, **pad)
-        self.log_box = scrolledtext.ScrolledText(frm_l, height=13, state="disabled", wrap="word")
+        self.log_box = scrolledtext.ScrolledText(frm_l, height=12, state="disabled", wrap="word")
         self.log_box.pack(fill="both", expand=True, padx=6, pady=6)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.log("ツールを起動しました。 (v%s)" % APP_VERSION)
-        if not os.path.exists(TEMPLATE_PATH):
-            self.log("⚠ ひな形 template.xlsx が見つかりません。")
 
         self.maybe_show_changelog_on_update()
-        self.updater.check_async(silent=True)   # 起動時に静かに更新チェック
+        self.updater.check_async(silent=True)
+        # フォルダが設定済みなら自動で監視開始(スタートアップ起動時も無操作で稼働)
+        self.root.after(500, self.auto_start_if_ready)
+
+    def auto_start_if_ready(self):
+        if (self.var_watch.get() and os.path.isdir(self.var_watch.get())
+                and self.var_out.get() and os.path.isdir(self.var_out.get())):
+            self.log("設定済みフォルダを検出。自動で監視を開始します。")
+            self.start_monitor()
 
     # after() ラッパ
     def after(self, ms, fn):
@@ -442,6 +475,16 @@ class App:
             self.log_box.configure(state="disabled")
         self.after(0, _append)
 
+    # スタートアップ
+    def toggle_startup(self):
+        want = self.var_startup.get()
+        try:
+            set_startup(want)
+            self.log("Windowsスタートアップ登録: %s" % ("ON" if want else "OFF"))
+        except OSError as e:
+            self.log("スタートアップ設定に失敗: %s" % e)
+            self.var_startup.set(startup_enabled())
+
     # 更新履歴
     def show_changelog(self):
         self._changelog_window(read_changelog(), "更新履歴")
@@ -449,7 +492,7 @@ class App:
     def maybe_show_changelog_on_update(self):
         last = self.cfg.get("last_seen_version", "")
         if last != APP_VERSION:
-            if last:   # 初回起動時は出さない
+            if last:
                 self._changelog_window(read_changelog(), "更新されました (v%s)" % APP_VERSION)
             self.cfg["last_seen_version"] = APP_VERSION
             self.persist()
@@ -492,14 +535,7 @@ class App:
         self.cfg["processed"] = sorted(self.processed)
         save_config(self.cfg)
 
-    # 処理
-    def _key(self, path):
-        try:
-            mtime = int(os.path.getmtime(path))
-        except OSError:
-            mtime = 0
-        return "%s|%s" % (os.path.basename(path), mtime)
-
+    # 処理 (ファイル名で処理済み判定 → 再起動・監視再開後も再処理しない)
     def process_file(self, path):
         out_dir = self.var_out.get()
         if not out_dir or not os.path.isdir(out_dir):
@@ -511,11 +547,11 @@ class App:
         except Exception as e:
             self.log("✖ 解析失敗 %s : %s" % (name, e))
             return False
-        out_path = os.path.join(out_dir, os.path.splitext(name)[0] + ".xlsx")
+        out_path = os.path.join(out_dir, os.path.splitext(name)[0] + ".csv")
         try:
-            write_excel(data, out_path)
+            write_csv(data, out_path)
         except Exception as e:
-            self.log("✖ Excel出力失敗 %s : %s" % (name, e))
+            self.log("✖ CSV出力失敗 %s : %s" % (name, e))
             return False
         self.log("✔ %s → %s (%s %s %s)" % (
             name, os.path.basename(out_path),
@@ -529,22 +565,30 @@ class App:
                 self.log("⚠ 監視元フォルダが未設定です。")
             return
         try:
-            files = [os.path.join(wdir, f) for f in os.listdir(wdir) if f.lower().endswith(".txt")]
+            files = [f for f in os.listdir(wdir) if f.lower().endswith(".txt")]
         except Exception as e:
             self.log("フォルダ読み取りエラー: %s" % e)
             return
-        new_count = 0
-        for path in sorted(files):
-            key = self._key(path)
-            if key in self.processed:
-                continue
-            if self.process_file(path):
-                self.processed.add(key)
-                new_count += 1
-        if new_count:
+        # 未処理(ファイル名ベース)のみ抽出
+        todo = [f for f in sorted(files) if f not in self.processed]
+        if not todo:
+            if force:
+                self.log("新規に処理するTXTはありませんでした。")
+            return
+        if len(todo) > 5:
+            self.log("未処理 %d 件を処理します…" % len(todo))
+        done = 0
+        for f in todo:
+            if self.process_file(os.path.join(wdir, f)):
+                self.processed.add(f)
+                done += 1
+            else:
+                # 失敗した場合も再試行を避けるなら add するが、
+                # ここでは成功したものだけ記録し、失敗は次回再試行する
+                pass
+        if done:
             self.persist()
-        elif force:
-            self.log("新規に処理するTXTはありませんでした。")
+            self.log("%d 件を処理しました。" % done)
 
     def process_all_now(self):
         threading.Thread(target=lambda: self.scan_once(force=True), daemon=True).start()
@@ -563,6 +607,8 @@ class App:
             self.start_monitor()
 
     def start_monitor(self):
+        if self.monitoring:
+            return
         if not self.var_watch.get() or not os.path.isdir(self.var_watch.get()):
             messagebox.showwarning("監視", "有効な監視元フォルダを指定してください。")
             return

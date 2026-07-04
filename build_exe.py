@@ -43,10 +43,9 @@ def main():
     cmd = [
         sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
         "--onefile", "--windowed", "--name", APP,
-        "--add-data", "template.xlsx%s." % sep,
         "--add-data", "VERSION%s." % sep,
         "--add-data", "CHANGELOG.md%s." % sep,
-        "--hidden-import", "openpyxl", "--hidden-import", "certifi",
+        "--hidden-import", "certifi",
         ENTRY,
     ]
     r = subprocess.run(cmd)
@@ -59,16 +58,22 @@ def main():
         print("[ERROR] EXE not found:", os.path.abspath(exe))
         return
 
-    # [4/4] done
+    # [4/4] 分かりやすい場所(プロジェクト直下の 配布/ )へコピー
     if os.path.isdir("build"):
         shutil.rmtree("build")
     if os.path.isfile(APP + ".spec"):
         os.remove(APP + ".spec")
 
+    dist_folder = "配布"
+    os.makedirs(dist_folder, exist_ok=True)
+    final = os.path.join(dist_folder, APP + ".exe")
+    shutil.copy2(exe, final)
+
     mb = os.path.getsize(exe) / (1024 * 1024)
     print("=" * 48)
     print("  BUILD OK!")
-    print("  EXE: dist\\%s.exe (%.1f MB)" % (APP, mb))
+    print("  EXE(配布用): %s (%.1f MB)" % (os.path.abspath(final), mb))
+    print("  ※このexe1つを別PCにコピーすれば動作します")
     print("=" * 48)
 
 
